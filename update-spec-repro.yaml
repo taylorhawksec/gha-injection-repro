@@ -1,0 +1,92 @@
+name: PoC - update-spec injection reproduction (coinbase/prime-sdk-ts)
+
+# Faithful reproduction of the vulnerable region of
+#   coinbase/prime-sdk-ts .github/workflows/update-spec.yml  (main @ 2d8feb1ef0)
+# The two steps between the BEGIN/END markers below are BYTE-IDENTICAL to lines
+# 41-75 of that file. Nothing in the reproduced region has been modified.
+#
+# Steps intentionally omitted (prerequisites only, not on the taint path):
+#   Setup Java / Setup Node / npm install / openapi-generator / run update-spec /
+#   diff / commit+push+PR.  They require .nvmrc + package.json and play no part
+#   in the source -> sink flow.
+#
+# Trigger changed from `schedule: 0 8 * * *` to `workflow_dispatch` for on-demand
+# execution. Both trigger on the DEFAULT BRANCH with the same `permissions:`
+# block, so the injection path is identical.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-spec:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+# ===================== BEGIN byte-identical region =====================
+      - name: Resolve target branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXISTING_BRANCH=$(gh pr list \
+            --state open \
+            --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("auto/update-spec"))] | .[0].headRefName // empty')
+
+          if [ -n "$EXISTING_BRANCH" ]; then
+            echo "branch=$EXISTING_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "has_open_pr=true" >> "$GITHUB_OUTPUT"
+            echo "Using existing open PR branch: $EXISTING_BRANCH"
+          else
+            echo "branch=auto/update-spec" >> "$GITHUB_OUTPUT"
+            echo "has_open_pr=false" >> "$GITHUB_OUTPUT"
+            echo "No open PR found; will use branch auto/update-spec"
+          fi
+
+      - name: Checkout target branch
+        run: |
+          BRANCH="${{ steps.branch.outputs.branch }}"
+          HAS_OPEN_PR="${{ steps.branch.outputs.has_open_pr }}"
+
+          if [ "$HAS_OPEN_PR" = "true" ]; then
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+            git pull --ff-only origin "$BRANCH"
+          elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin main "$BRANCH"
+            git checkout -B "$BRANCH" origin/main
+          else
+            git checkout -b "$BRANCH"
+          fi
+# ====================== END byte-identical region ======================
+
+      - name: PoC verification (instrumentation, NOT part of the reproduced code)
+        if: always()
+        run: |
+          echo "=================== PoC RESULT ==================="
+          echo "-- 1. did the branch name execute as a shell command? --"
+          if [ -f /tmp/gh0stfqce-poc-marker ]; then
+            echo "   INJECTION CONFIRMED - marker written by the branch name"
+            echo "   marker contents:"
+            sed 's/^/     /' /tmp/gh0stfqce-poc-marker
+          else
+            echo "   no marker - injection did not fire"
+          fi
+          echo
+          echo "-- 2. is the checkout credential reachable from that same shell? --"
+          if [ -n "$(git config --get http.extraheader || true)" ]; then
+            echo "   TOKEN PRESENT in .git/config (persist-credentials not disabled)"
+            echo "   (value deliberately not printed)"
+          else
+            echo "   no persisted credential found"
+          fi
+          echo "================================================="
